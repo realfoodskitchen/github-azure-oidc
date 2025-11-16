@@ -20,13 +20,6 @@ APP_NAME=$1
 export REPO=$2
 FICS_FILE=$3
 
-for DEP in az gh jq envsubst; do
-    if ! command -v "$DEP" >/dev/null 2>&1; then
-        echo "The '$DEP' command is required but not installed or not on PATH."
-        exit 1
-    fi
-done
-
 echo "Checking Azure CLI login status..."
 EXPIRED_TOKEN=$(az ad signed-in-user show --query 'id' -o tsv || true)
 
@@ -97,23 +90,12 @@ echo "SP_ID: $SP_ID"
 
 echo "Creating Federated Identity Credentials..."
 echo 
-FIC_COUNT=$(envsubst < "$FICS_FILE" | jq 'length')
-if [[ "$FIC_COUNT" -eq 0 ]]; then
-    echo "No federated identity definitions found in '$FICS_FILE'."
-else
-    envsubst < "$FICS_FILE" | jq -c '.[]' | while IFS= read -r FIC; do
-        SUBJECT=$(jq -r '.subject' <<< "$FIC")
-
-        echo "Creating FIC with subject '${SUBJECT}'."
-        TMP_FIC_FILE=$(mktemp)
-        printf '%s\n' "$FIC" > "$TMP_FIC_FILE"
-        az ad app federated-credential create --id "$APP_ID" --parameters @"$TMP_FIC_FILE"
-        rm -f "$TMP_FIC_FILE"
-    done
-fi
-
-echo "Current Federated Identity Credentials on the app:"
-az ad app federated-credential list --id "$APP_ID"
+for FIC in $(envsubst < $FICS_FILE | jq -c '.[]'); do
+    SUBJECT=$(jq -r '.subject' <<< "$FIC")
+    
+    echo "Creating FIC with subject '${SUBJECT}'."
+    az ad app federated-credential create --id  $APP_ID --parameters ${FIC} || true
+done
 
 # To get an Azure AD app FICs
 # az ad app federated-credential list --id $APP_ID
