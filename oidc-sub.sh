@@ -44,7 +44,9 @@ esac
 
 echo "Getting Subscription Id..."
 SUB_ID=$(az account show --query id -o tsv)
-echo "SUB_ID: $SUB_ID"
+SUB_NAME=$(az account show --query name -o tsv)
+echo "Subscription: $SUB_NAME ($SUB_ID)"
+ROLE_SCOPE="/subscriptions/$SUB_ID"
 
 echo "Getting Tenant Id..."
 TENANT_ID=$(az account show --query tenantId -o tsv)
@@ -79,12 +81,34 @@ then
     echo "Sleeping for 30 seconds to give time for the SP to be created."
     sleep 30s
 
-    echo "Creating role assignment..."
-    az role assignment create --role contributor --subscription $SUB_ID --assignee-object-id $SP_ID --assignee-principal-type ServicePrincipal
+    echo "Creating initial Contributor role assignment on $ROLE_SCOPE..."
+    az role assignment create \
+        --role contributor \
+        --scope "$ROLE_SCOPE" \
+        --assignee-object-id $SP_ID \
+        --assignee-principal-type ServicePrincipal
     sleep 30s
 else
     echo "Existing Service Principal found."
 fi
+
+echo "Ensuring Contributor role assignment on $ROLE_SCOPE..."
+ASSIGNMENT_OUTPUT=$(az role assignment create \
+    --role contributor \
+    --scope "$ROLE_SCOPE" \
+    --assignee-object-id $SP_ID \
+    --assignee-principal-type ServicePrincipal \
+    --only-show-errors 2>&1) || true
+
+echo "Azure CLI response:"
+echo "$ASSIGNMENT_OUTPUT"
+
+echo "Current role assignments for this SP on $ROLE_SCOPE:"
+az role assignment list \
+    --assignee $SP_ID \
+    --role contributor \
+    --scope "$ROLE_SCOPE" \
+    --output table
 
 echo "SP_ID: $SP_ID"
 
