@@ -7,8 +7,8 @@ set -euo pipefail
     # Install GitHub CLI - https://cli.github.com/
     # Install JQ - https://stedolan.github.io/jq/download/
 
-# ./oidc.sh {APP_NAME} {ORG|USER/REPO} {FICS_FILE}
-# ./oidc.sh ghazoidc1 jongio/ghazoidctest ./fics.json
+# ./oidc-sub.sh {APP_NAME} {ORG|USER/REPO} {FICS_FILE} [ENVIRONMENT...]
+# ./oidc-sub.sh ghazoidc1 jongio/ghazoidctest ./fics.json "Staging" "Production"
 IS_CODESPACE=${CODESPACES:-"false"}
 if $IS_CODESPACE == "true"
 then
@@ -19,13 +19,8 @@ fi
 APP_NAME=$1
 export REPO=$2
 FICS_FILE=$3
-
-for DEP in az gh jq envsubst; do
-    if ! command -v "$DEP" >/dev/null 2>&1; then
-        echo "The '$DEP' command is required but not installed or not on PATH."
-        exit 1
-    fi
-done
+shift 3
+ENVIRONMENTS=("$@")
 
 echo "Checking Azure CLI login status..."
 EXPIRED_TOKEN=$(az ad signed-in-user show --query 'id' -o tsv || true)
@@ -51,7 +46,9 @@ esac
 
 echo "Getting Subscription Id..."
 SUB_ID=$(az account show --query id -o tsv)
-echo "SUB_ID: $SUB_ID"
+SUB_NAME=$(az account show --query name -o tsv)
+echo "Subscription: $SUB_NAME ($SUB_ID)"
+ROLE_SCOPE="/subscriptions/$SUB_ID"
 
 echo "Getting Tenant Id..."
 TENANT_ID=$(az account show --query tenantId -o tsv)
@@ -86,34 +83,45 @@ then
     echo "Sleeping for 30 seconds to give time for the SP to be created."
     sleep 30s
 
-    echo "Creating role assignment..."
-    az role assignment create --role contributor --subscription $SUB_ID --assignee-object-id $SP_ID --assignee-principal-type ServicePrincipal
+    echo "Creating initial Contributor role assignment on $ROLE_SCOPE..."
+    az role assignment create \
+        --role contributor \
+        --scope "$ROLE_SCOPE" \
+        --assignee-object-id $SP_ID \
+        --assignee-principal-type ServicePrincipal
     sleep 30s
 else
     echo "Existing Service Principal found."
 fi
 
+echo "Ensuring Contributor role assignment on $ROLE_SCOPE..."
+ASSIGNMENT_OUTPUT=$(az role assignment create \
+    --role contributor \
+    --scope "$ROLE_SCOPE" \
+    --assignee-object-id $SP_ID \
+    --assignee-principal-type ServicePrincipal \
+    --only-show-errors 2>&1) || true
+
+echo "Azure CLI response:"
+echo "$ASSIGNMENT_OUTPUT"
+
+echo "Current role assignments for this SP on $ROLE_SCOPE:"
+az role assignment list \
+    --assignee $SP_ID \
+    --role contributor \
+    --scope "$ROLE_SCOPE" \
+    --output table
+
 echo "SP_ID: $SP_ID"
 
 echo "Creating Federated Identity Credentials..."
 echo 
-FIC_COUNT=$(envsubst < "$FICS_FILE" | jq 'length')
-if [[ "$FIC_COUNT" -eq 0 ]]; then
-    echo "No federated identity definitions found in '$FICS_FILE'."
-else
-    envsubst < "$FICS_FILE" | jq -c '.[]' | while IFS= read -r FIC; do
-        SUBJECT=$(jq -r '.subject' <<< "$FIC")
-
-        echo "Creating FIC with subject '${SUBJECT}'."
-        TMP_FIC_FILE=$(mktemp)
-        printf '%s\n' "$FIC" > "$TMP_FIC_FILE"
-        az ad app federated-credential create --id "$APP_ID" --parameters @"$TMP_FIC_FILE"
-        rm -f "$TMP_FIC_FILE"
-    done
-fi
-
-echo "Current Federated Identity Credentials on the app:"
-az ad app federated-credential list --id "$APP_ID"
+for FIC in $(envsubst < $FICS_FILE | jq -c '.[]'); do
+    SUBJECT=$(jq -r '.subject' <<< "$FIC")
+    
+    echo "Creating FIC with subject '${SUBJECT}'."
+    az ad app federated-credential create --id  $APP_ID --parameters ${FIC} || true
+done
 
 # To get an Azure AD app FICs
 # az ad app federated-credential list --id $APP_ID
@@ -126,14 +134,23 @@ az ad app federated-credential list --id "$APP_ID"
 # https://ms.portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/${APP_ID}
 # Certificates & secrets, Click on Federated credentials
 
-echo "Creating the following GitHub repo secrets..."
-echo AZURE_CLIENT_ID=$APP_ID
-echo AZURE_SUBSCRIPTION_ID=$SUB_ID
-echo AZURE_TENANT_ID=$TENANT_ID
-
 echo "Logging into GitHub CLI..."
 gh auth login
 
-gh secret set AZURE_CLIENT_ID -b${APP_ID} --repo $REPO
-gh secret set AZURE_SUBSCRIPTION_ID -b${SUB_ID} --repo $REPO
-gh secret set AZURE_TENANT_ID -b${TENANT_ID} --repo $REPO
+if [[ ${#ENVIRONMENTS[@]} -eq 0 ]]; then
+    echo "No environments specified. Creating repo-level secrets..."
+    gh secret set AZURE_CLIENT_ID -b${APP_ID} --repo $REPO
+    gh secret set AZURE_SUBSCRIPTION_ID -b${SUB_ID} --repo $REPO
+    gh secret set AZURE_TENANT_ID -b${TENANT_ID} --repo $REPO
+else
+    echo "Environments specified; configuring secrets only for: ${ENVIRONMENTS[*]}"
+    for ENV_NAME in "${ENVIRONMENTS[@]}"; do
+        if [[ -z "$ENV_NAME" ]]; then
+            continue
+        fi
+        echo "Setting environment secrets for '$ENV_NAME'..."
+        gh secret set AZURE_CLIENT_ID -b${APP_ID} --repo $REPO --env "$ENV_NAME"
+        gh secret set AZURE_SUBSCRIPTION_ID -b${SUB_ID} --repo $REPO --env "$ENV_NAME"
+        gh secret set AZURE_TENANT_ID -b${TENANT_ID} --repo $REPO --env "$ENV_NAME"
+    done
+fi
