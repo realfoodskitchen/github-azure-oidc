@@ -1,13 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 
-# ./oidc-mg.sh {APP_NAME} {ORG|USER/REPO} {FICS_FILE}
+# ./oidc-mg.sh {APP_NAME} {ORG|USER/REPO} {FICS_FILE} [ENVIRONMENT...]
+# Configures GitHub OIDC against an Azure management group. Creates/uses an AD app,
+# ensures a Service Principal has Contributor at the MG scope, provisions FICs, and
+# writes the GitHub secrets needed by workflows.
+#
+# Quick guide:
+#   1. Prepare prerequisites: Azure CLI, GitHub CLI, jq, and envsubst installed and logged in. (note these are pre-installed in Azure Cloud Shell if running the script there.)
+#   2. Build or update your FIC definition JSON (see fics.json for an example).
+#   3. Run this script with: ./oidc-mg.sh <APP_NAME> <ORG/REPO> <FICS_FILE> [ENV...] Leaving the Environment blank will result in repo-level secrets.
+#   4. When prompted, pick the management group scope and (if not provided) GitHub environment names.
 
 if [[ $# -lt 3 ]]; then
-    echo "Usage: $0 <APP_NAME> <ORG|USER/REPO> <FICS_FILE>"
+    echo "Usage: $0 <APP_NAME> <ORG|USER/REPO> <FICS_FILE> [ENVIRONMENT...]"
     exit 1
 fi
 
+# Role assignments in Codespaces are unreliable; exit early with guidance.
 IS_CODESPACE=${CODESPACES:-"false"}
 if [[ "$IS_CODESPACE" == "true" ]]
 then
@@ -18,18 +28,84 @@ fi
 APP_NAME=$1
 export REPO=$2
 FICS_FILE=$3
+shift 3
+ENVIRONMENTS=("$@")
 
+# Validate the FIC definition file before doing any Azure work.
 if [[ ! -f "$FICS_FILE" ]]; then
     echo "Federated identity credentials file not found: $FICS_FILE"
     exit 1
 fi
 
+# Confirm required CLIs exist.
 for DEP in az gh jq envsubst; do
     if ! command -v "$DEP" >/dev/null 2>&1; then
         echo "The '$DEP' command is required but not installed or not on PATH."
         exit 1
     fi
 done
+
+# Utility to trim whitespace from interactive entries.
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+# Ensure `gh` can call the API/secrets endpoint without prompting mid-script.
+ensure_github_login() {
+    if gh auth status -h github.com >/dev/null 2>&1; then
+        echo "GitHub CLI already authenticated."
+    else
+        echo "GitHub CLI not authenticated. Logging in..."
+        gh auth login
+    fi
+}
+
+# Show existing environments to avoid typos during secret scoping.
+list_github_environments() {
+    local repo_slug=$1
+    echo "Retrieving GitHub environments for $repo_slug..."
+    if ! ENV_OUTPUT=$(gh api \
+        -H "Accept: application/vnd.github+json" \
+        "/repos/${repo_slug}/environments?per_page=100" 2>/dev/null); then
+        echo "Unable to list GitHub environments (verify repository access)."
+        return
+    fi
+
+    local COUNT
+    COUNT=$(echo "$ENV_OUTPUT" | jq '.total_count // 0')
+    if [[ "$COUNT" -eq 0 ]]; then
+        echo "No GitHub environments currently exist for $repo_slug."
+        return
+    fi
+
+    echo "Available GitHub environments:"
+    echo "$ENV_OUTPUT" | jq -r '.environments[]?.name' | while IFS= read -r name; do
+        echo "- $name"
+    done
+}
+
+ensure_github_login
+list_github_environments "$REPO"
+
+# Prompt for environment names only if they were not provided as arguments.
+if [[ ${#ENVIRONMENTS[@]} -eq 0 ]]; then
+    echo
+    read -r -p "Enter GitHub environment names (comma-separated) or press Enter to configure repo-level secrets: " ENV_RESPONSE
+    if [[ -n "$ENV_RESPONSE" ]]; then
+        IFS=',' read -ra ENVIRONMENTS <<< "$ENV_RESPONSE"
+        TMP_ENV=()
+        for env in "${ENVIRONMENTS[@]}"; do
+            TRIMMED_ENV=$(trim_whitespace "$env")
+            if [[ -n "$TRIMMED_ENV" ]]; then
+                TMP_ENV+=("$TRIMMED_ENV")
+            fi
+        done
+        ENVIRONMENTS=("${TMP_ENV[@]}")
+    fi
+fi
 
 echo "Checking Azure CLI login status..."
 EXPIRED_TOKEN=$(az ad signed-in-user show --query 'id' -o tsv || true)
@@ -39,27 +115,16 @@ then
     az login -o none
 fi
 
-ACCOUNT=$(az account show --query '[id,name]')
-echo $ACCOUNT
-
-echo "Getting Subscription Id..."
-SUB_ID=$(az account show --query id -o tsv)
-SUB_NAME=$(az account show --query name -o tsv)
-echo "SUB: $SUB_NAME ($SUB_ID)"
-
-ensure_managementgroups_extension() {
-    if ! az extension show --name managementgroups >/dev/null 2>&1; then
-        echo "Azure CLI 'managementgroups' extension not found. Installing..."
-        az extension add --name managementgroups >/dev/null
-        echo "Extension installed."
-    fi
-}
-
-ensure_managementgroups_extension
-
+# List available management groups so the operator can select a scope confidently.
 echo "Fetching management groups (name | displayName | id)..."
-if ! MG_LIST=$(az account management-group list --query "value[].{name:name,displayName:displayName,id:id}" -o json --only-show-errors); then
-    echo "Unable to retrieve management groups. Ensure you have access and the managementgroups extension installed."
+MG_LIST=$(az rest \
+    --method get \
+    --url "https://management.azure.com/providers/Microsoft.Management/managementGroups?api-version=2021-04-01" \
+    --query "value[].{name:name,displayName:properties.displayName,id:id}" \
+    -o json --only-show-errors) || true
+
+if [[ -z "$MG_LIST" || "$MG_LIST" == "null" ]]; then
+    echo "Unable to retrieve management groups. Ensure you have access to management groups in this tenant."
     exit 1
 fi
 if [[ "$(echo "$MG_LIST" | jq length)" -eq 0 ]]; then
@@ -91,6 +156,8 @@ while true; do
     fi
 done
 
+ROLE_SCOPE="$MG_SCOPE"
+
 echo "Getting Tenant Id..."
 TENANT_ID=$(az account show --query tenantId -o tsv)
 echo "TENANT_ID: $TENANT_ID"
@@ -105,7 +172,7 @@ then
     echo "Creating AD app..."
     APP_ID=$(az ad app create --display-name ${APP_NAME} --query appId -o tsv)
     echo "Sleeping for 30 seconds to give time for the APP to be created."
-    sleep 30s
+    sleep 30
 else
     echo "Existing AD app found."
 fi
@@ -122,22 +189,36 @@ then
     SP_ID=$(az ad sp create --id $APP_ID --query id -o tsv)
 
     echo "Sleeping for 30 seconds to give time for the SP to be created."
-    sleep 30s
+    sleep 30
 
-    echo "Creating role assignment..."
-    az role assignment create --role contributor --scope "$MG_SCOPE" --assignee-object-id $SP_ID --assignee-principal-type ServicePrincipal
-    sleep 30s
+    echo "Creating initial Contributor role assignment on $ROLE_SCOPE..."
+    az role assignment create \
+        --role contributor \
+        --scope "$ROLE_SCOPE" \
+        --assignee-object-id $SP_ID \
+        --assignee-principal-type ServicePrincipal
+    sleep 30
 else
     echo "Existing Service Principal found."
 fi
 
-echo "Ensuring role assignment on $MG_SCOPE..."
-ASSIGNMENT_COUNT=$(az role assignment list --assignee-object-id $SP_ID --scope "$MG_SCOPE" --query "length(@)" -o tsv)
-if [[ "$ASSIGNMENT_COUNT" == "0" ]]; then
-    az role assignment create --role contributor --scope "$MG_SCOPE" --assignee-object-id $SP_ID --assignee-principal-type ServicePrincipal
-else
-    echo "Role assignment already exists for this scope."
-fi
+echo "Ensuring Contributor role assignment on $ROLE_SCOPE..."
+ASSIGNMENT_OUTPUT=$(az role assignment create \
+    --role contributor \
+    --scope "$ROLE_SCOPE" \
+    --assignee-object-id $SP_ID \
+    --assignee-principal-type ServicePrincipal \
+    --only-show-errors 2>&1) || true
+
+echo "Azure CLI response:"
+echo "$ASSIGNMENT_OUTPUT"
+
+echo "Current role assignments for this SP on $ROLE_SCOPE:"
+az role assignment list \
+    --assignee $SP_ID \
+    --role contributor \
+    --scope "$ROLE_SCOPE" \
+    --output table
 
 echo "SP_ID: $SP_ID"
 
@@ -161,14 +242,21 @@ done
 # https://ms.portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/${APP_ID}
 # Certificates & secrets, Click on Federated credentials
 
-echo "Creating the following GitHub repo secrets..."
-echo AZURE_CLIENT_ID=$APP_ID
-echo AZURE_SUBSCRIPTION_ID=$SUB_ID
-echo AZURE_TENANT_ID=$TENANT_ID
-
-echo "Logging into GitHub CLI..."
-gh auth login
-
-gh secret set AZURE_CLIENT_ID -b${APP_ID} --repo $REPO
-gh secret set AZURE_SUBSCRIPTION_ID -b${SUB_ID} --repo $REPO
-gh secret set AZURE_TENANT_ID -b${TENANT_ID} --repo $REPO
+# Secret creation targets repo-level scope unless specific environments were requested.
+if [[ ${#ENVIRONMENTS[@]} -eq 0 ]]; then
+    echo "No environments specified. Creating repo-level secrets..."
+    gh secret set AZURE_CLIENT_ID -b${APP_ID} --repo $REPO
+    gh secret set AZURE_MANAGEMENT_GROUP_ID -b${MG_SCOPE} --repo $REPO
+    gh secret set AZURE_TENANT_ID -b${TENANT_ID} --repo $REPO
+else
+    echo "Environments specified; configuring secrets only for: ${ENVIRONMENTS[*]}"
+    for ENV_NAME in "${ENVIRONMENTS[@]}"; do
+        if [[ -z "$ENV_NAME" ]]; then
+            continue
+        fi
+        echo "Setting environment secrets for '$ENV_NAME'..."
+        gh secret set AZURE_CLIENT_ID -b${APP_ID} --repo $REPO --env "$ENV_NAME"
+        gh secret set AZURE_MANAGEMENT_GROUP_ID -b${MG_SCOPE} --repo $REPO --env "$ENV_NAME"
+        gh secret set AZURE_TENANT_ID -b${TENANT_ID} --repo $REPO --env "$ENV_NAME"
+    done
+fi

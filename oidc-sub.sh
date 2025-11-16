@@ -1,14 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# Open in DevContainer or...
-
-    # Install Azure CLI- https://docs.microsoft.com/en-us/cli/azure/install-azure-cli
-    # Install GitHub CLI - https://cli.github.com/
-    # Install JQ - https://stedolan.github.io/jq/download/
-
 # ./oidc-sub.sh {APP_NAME} {ORG|USER/REPO} {FICS_FILE} [ENVIRONMENT...]
-# ./oidc-sub.sh ghazoidc1 jongio/ghazoidctest ./fics.json "Staging" "Production"
+# Configures GitHub OIDC against an Azure subscription. Creates/uses an AD app,
+# ensures a Service Principal has Contributor at the MG scope, provisions FICs, and
+# writes the GitHub secrets needed by workflows.
+#
+# Quick guide:
+#   1. Prepare prerequisites: Azure CLI, GitHub CLI, jq, and envsubst installed and logged in. (note these are pre-installed in Azure Cloud Shell if running the script there.)
+#   2. Build or update your FIC definition JSON (see fics.json for an example).
+#   3. Run this script with: ./oidc-sub.sh <APP_NAME> <ORG/REPO> <FICS_FILE> [ENV...] Leaving the Environment blank will result in repo-level secrets.
+#   4. When prompted, pick the management group scope and (if not provided) GitHub environment names.
 IS_CODESPACE=${CODESPACES:-"false"}
 if $IS_CODESPACE == "true"
 then
