@@ -79,16 +79,10 @@ prompt_repo() {
 
 prompt_environment() {
     local response
-    while true; do
-        read -r -p "Enter GitHub environment name: " response
-        response=$(trim "$response")
-        if [[ -n "$response" ]]; then
-            ENV_NAME="$response"
-            export ENV_NAME
-            break
-        fi
-        echo "Environment name cannot be empty."
-    done
+    read -r -p "Enter GitHub environment name (leave blank for repo-level secrets): " response
+    response=$(trim "$response")
+    ENV_NAME="$response"
+    export ENV_NAME
 }
 
 ensure_environment_exists() {
@@ -143,7 +137,9 @@ prompt_repo
 ensure_github_login
 list_github_environments "$REPO"
 prompt_environment
-ensure_environment_exists "$REPO" "$ENV_NAME"
+if [[ -n "$ENV_NAME" ]]; then
+    ensure_environment_exists "$REPO" "$ENV_NAME"
+fi
 prompt_app_name
 prompt_fics_file
 
@@ -253,19 +249,32 @@ for FIC in $(envsubst < "$FICS_FILE" | jq -c '.[]'); do
     az ad app federated-credential create --id "$APP_ID" --parameters "${FIC}" || true
 done
 
-echo "Setting GitHub secrets for environment '$ENV_NAME'..."
-gh secret set AZURE_CLIENT_ID -b"$APP_ID" --repo "$REPO" --env "$ENV_NAME"
-gh secret set AZURE_SUBSCRIPTION_ID -b"$SUBSCRIPTION_ID" --repo "$REPO" --env "$ENV_NAME"
-gh secret set AZURE_TENANT_ID -b"$TENANT_ID" --repo "$REPO" --env "$ENV_NAME"
+if [[ -z "$ENV_NAME" ]]; then
+    echo "Setting repository-level secrets..."
+    gh secret set AZURE_CLIENT_ID -b"$APP_ID" --repo "$REPO"
+    gh secret set AZURE_SUBSCRIPTION_ID -b"$SUBSCRIPTION_ID" --repo "$REPO"
+    gh secret set AZURE_TENANT_ID -b"$TENANT_ID" --repo "$REPO"
+else
+    echo "Setting GitHub secrets for environment '$ENV_NAME'..."
+    gh secret set AZURE_CLIENT_ID -b"$APP_ID" --repo "$REPO" --env "$ENV_NAME"
+    gh secret set AZURE_SUBSCRIPTION_ID -b"$SUBSCRIPTION_ID" --repo "$REPO" --env "$ENV_NAME"
+    gh secret set AZURE_TENANT_ID -b"$TENANT_ID" --repo "$REPO" --env "$ENV_NAME"
+fi
+
+if [[ -z "$ENV_NAME" ]]; then
+    ENV_TARGET="Repository secrets"
+else
+    ENV_TARGET="Environment: $ENV_NAME"
+fi
 
 cat <<SUMMARY
 
 All done!
 - Repository: $REPO
-- Environment: $ENV_NAME
+- $ENV_TARGET
 - App Registration: $APP_NAME ($APP_ID)
 - Service Principal: $SP_ID
 - Subscription Scope: $ROLE_SCOPE
 
-You can now use the configured environment secrets in your GitHub workflows.
+You can now use the configured secrets in your GitHub workflows.
 SUMMARY
