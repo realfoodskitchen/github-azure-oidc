@@ -15,12 +15,6 @@ for DEP in az gh jq envsubst; do
     fi
 done
 
-# Configure the scopes used for diagnostic role assignments. Edit these two
-# values (or set env vars) after cloning to point at your shared Event Hub and
-# Log Analytics Workspace.
-DEFAULT_EVENT_HUB_SCOPE="${DEFAULT_EVENT_HUB_SCOPE:-REPLACE_WITH_EVENT_HUB_RESOURCE_ID}"
-DEFAULT_LOG_ANALYTICS_SCOPE="${DEFAULT_LOG_ANALYTICS_SCOPE:-REPLACE_WITH_LOG_ANALYTICS_RESOURCE_ID}"
-
 trim() {
     local value="$1"
     value="${value#"${value%%[![:space:]]*}"}"
@@ -139,84 +133,6 @@ prompt_app_name() {
     export APP_NAME
 }
 
-prompt_subscription_tier() {
-    local response
-    while true; do
-        read -r -p "Select subscription tier (DEV/STG/PRD): " response
-        response=$(trim "$response")
-        response=$(printf '%s' "$response" | tr '[:lower:]' '[:upper:]')
-        case "$response" in
-            DEV|STG|PRD)
-                SUBSCRIPTION_TIER="$response"
-                APPLY_DIAGNOSTICS_ROLES="false"
-                if [[ "$SUBSCRIPTION_TIER" == "STG" || "$SUBSCRIPTION_TIER" == "PRD" ]]; then
-                    APPLY_DIAGNOSTICS_ROLES="true"
-                fi
-                export SUBSCRIPTION_TIER APPLY_DIAGNOSTICS_ROLES
-                break
-                ;;
-            *)
-                echo "Please enter DEV, STG, or PRD."
-                ;;
-        esac
-    done
-}
-
-assign_role_if_scope_present() {
-    local role_name="$1"
-    local scope="$2"
-
-    if [[ -z "$scope" ]]; then
-        echo "No scope provided for role '$role_name'; skipping."
-        return
-    fi
-
-    echo "Ensuring role assignment '$role_name' on $scope..."
-    local output
-    if ! output=$(az role assignment create \
-        --role "$role_name" \
-        --scope "$scope" \
-        --assignee-object-id "$SP_ID" \
-        --assignee-principal-type ServicePrincipal \
-        --only-show-errors 2>&1); then
-        echo "Failed to assign role '$role_name' on scope '$scope'."
-        echo "$output"
-        return 1
-    fi
-    echo "$output"
-}
-
-ensure_diagnostic_scopes() {
-    if [[ "$APPLY_DIAGNOSTICS_ROLES" != "true" ]]; then
-        return
-    fi
-    if [[ "$EVENT_HUB_SCOPE" == "REPLACE_WITH_EVENT_HUB_RESOURCE_ID" ]]; then
-        EVENT_HUB_SCOPE=""
-    fi
-    if [[ "$LOG_ANALYTICS_SCOPE" == "REPLACE_WITH_LOG_ANALYTICS_RESOURCE_ID" ]]; then
-        LOG_ANALYTICS_SCOPE=""
-    fi
-    while [[ -z "$EVENT_HUB_SCOPE" ]]; do
-        read -r -p "Enter resource ID for Event Hub (Data Sender scope): " response
-        response=$(trim "$response")
-        if [[ -z "$response" ]]; then
-            echo "Event Hub scope is required for diagnostics roles."
-            continue
-        fi
-        EVENT_HUB_SCOPE="$response"
-    done
-    while [[ -z "$LOG_ANALYTICS_SCOPE" ]]; do
-        read -r -p "Enter resource ID for Log Analytics Workspace (Contributor scope): " response
-        response=$(trim "$response")
-        if [[ -z "$response" ]]; then
-            echo "Log Analytics scope is required for diagnostics roles."
-            continue
-        fi
-        LOG_ANALYTICS_SCOPE="$response"
-    done
-    export EVENT_HUB_SCOPE LOG_ANALYTICS_SCOPE
-}
-
 prompt_repo
 ensure_github_login
 list_github_environments "$REPO"
@@ -226,11 +142,6 @@ if [[ -n "$ENV_NAME" ]]; then
 fi
 prompt_app_name
 prompt_fics_file
-prompt_subscription_tier
-
-EVENT_HUB_SCOPE="${EVENT_HUB_SCOPE:-$DEFAULT_EVENT_HUB_SCOPE}"
-LOG_ANALYTICS_SCOPE="${LOG_ANALYTICS_SCOPE:-$DEFAULT_LOG_ANALYTICS_SCOPE}"
-ensure_diagnostic_scopes
 
 echo "Checking Azure CLI login status..."
 EXPIRED_TOKEN=$(az ad signed-in-user show --query 'id' -o tsv || true)
@@ -329,18 +240,6 @@ az role assignment list \
     --scope "$ROLE_SCOPE" \
     --output table
 
-if [[ "$APPLY_DIAGNOSTICS_ROLES" == "true" ]]; then
-    echo "Applying diagnostic roles (tier: $SUBSCRIPTION_TIER)..."
-    assign_role_if_scope_present "Azure Event Hubs Data Sender" "$EVENT_HUB_SCOPE" || exit 1
-    assign_role_if_scope_present "Log Analytics Contributor" "$LOG_ANALYTICS_SCOPE" || exit 1
-    echo "Current role assignments on Event Hub scope:"
-    az role assignment list --assignee "$SP_ID" --scope "$EVENT_HUB_SCOPE" --output table || true
-    echo "Current role assignments on Log Analytics scope:"
-    az role assignment list --assignee "$SP_ID" --scope "$LOG_ANALYTICS_SCOPE" --output table || true
-else
-    echo "Skipping diagnostic roles for tier: $SUBSCRIPTION_TIER"
-fi
-
 echo "SP_ID: $SP_ID"
 
 echo "Creating Federated Identity Credentials from $FICS_FILE..."
@@ -376,7 +275,6 @@ All done!
 - App Registration: $APP_NAME ($APP_ID)
 - Service Principal: $SP_ID
 - Subscription Scope: $ROLE_SCOPE
-- Subscription Tier: $SUBSCRIPTION_TIER
 
 You can now use the configured secrets in your GitHub workflows.
 SUMMARY
